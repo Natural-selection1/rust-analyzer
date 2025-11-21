@@ -1,6 +1,6 @@
 use hir::HasSource;
 use syntax::{
-    Edition,
+    Edition, ToSmolStr,
     ast::{self, AstNode, make},
     syntax_editor::{Position, SyntaxEditor},
 };
@@ -8,10 +8,7 @@ use syntax::{
 use crate::{
     AssistId,
     assist_context::{AssistContext, Assists},
-    utils::{
-        DefaultMethods, IgnoreAssocItems, add_trait_assoc_items_to_impl, filter_assoc_items,
-        gen_trait_fn_body,
-    },
+    utils::{DefaultMethods, IgnoreAssocItems},
 };
 
 // Assist: add_impl_missing_members
@@ -104,51 +101,54 @@ pub(crate) fn add_missing_default_members(
 fn add_missing_impl_members_inner(
     acc: &mut Assists,
     ctx: &AssistContext<'_>,
+    // 模式枚举：决定是要添加必需成员还是可选的默认成员
     mode: DefaultMethods,
-    ignore_items: IgnoreAssocItems,
+    // 是否忽略带有 #[doc(hidden)] 属性的关联项
+    mut ignore_items: IgnoreAssocItems,
     assist_id: &'static str,
     label: &'static str,
 ) -> Option<()> {
-    let _p = tracing::info_span!("add_missing_impl_members_inner").entered();
+    let _ = tracing::info_span!("add_missing_impl_members_inner").entered();
     let impl_def = ctx.find_node_at_offset::<ast::Impl>()?;
-    let impl_ = ctx.sema.to_def(&impl_def)?;
 
-    if ctx.token_at_offset().all(|t| {
-        t.parent_ancestors()
+    if ctx.token_at_offset().all(|token| {
+        token
+            .parent_ancestors()
             .take_while(|node| node != impl_def.syntax())
             .any(|s| ast::BlockExpr::can_cast(s.kind()) || ast::ParamList::can_cast(s.kind()))
     }) {
         return None;
     }
 
-    let target_scope = ctx.sema.scope(impl_def.syntax())?;
+    // 从 AST impl 获取 HIR impl 定义
+    let impl_ = ctx.sema.to_def(&impl_def)?;
+    // 获取 impl 实现的 trait 引用
     let trait_ref = impl_.trait_ref(ctx.db())?;
+    // 获取 trait 定义
     let trait_ = trait_ref.trait_();
 
-    let mut ign_item = ignore_items;
+    // 如果是本地 crate, 则放宽条件
+    let db = ctx.db();
+    trait_.module(db).krate().origin(db).is_local().then(|| ignore_items = IgnoreAssocItems::No);
 
-    if let IgnoreAssocItems::DocHiddenAttrPresent = ignore_items {
-        // Relax condition for local crates.
-        let db = ctx.db();
-        if trait_.module(db).krate().origin(db).is_local() {
-            ign_item = IgnoreAssocItems::No;
-        }
-    }
-
-    let missing_items = filter_assoc_items(
+    // 获取并过滤缺失的关联项
+    let missing_items = crate::utils::filter_assoc_items(
         &ctx.sema,
         &ide_db::traits::get_missing_assoc_items(&ctx.sema, &impl_def),
         mode,
-        ign_item,
+        ignore_items,
     );
 
     if missing_items.is_empty() {
         return None;
     }
 
-    let target = impl_def.syntax().text_range();
-    acc.add(AssistId::quick_fix(assist_id), label, target, |edit| {
-        let new_item = add_trait_assoc_items_to_impl(
+    // 获取 impl 所在的作用域
+    let target_scope = ctx.sema.scope(impl_def.syntax())?;
+
+    acc.add(AssistId::quick_fix(assist_id), label, impl_def.syntax().text_range(), |edit| {
+        // 生成缺失的 trait 关联项并插入到 impl 中
+        let new_items = crate::utils::add_trait_assoc_items_to_impl(
             &ctx.sema,
             ctx.config,
             &missing_items,
@@ -157,10 +157,12 @@ fn add_missing_impl_members_inner(
             &target_scope,
         );
 
-        let Some((first_new_item, other_items)) = new_item.split_first() else {
+        // 分离第一个新项和其他项
+        let Some((first_new_item, other_items)) = new_items.split_first() else {
             return;
         };
 
+        // 对于非默认方法，尝试生成函数体
         let mut first_new_item = if let DefaultMethods::No = mode
             && let ast::AssocItem::Fn(func) = &first_new_item
             && let Some(body) = try_gen_trait_body(
@@ -179,26 +181,32 @@ fn add_missing_impl_members_inner(
             Some(first_new_item.clone())
         };
 
+        // 收集所有新的关联项
         let new_assoc_items = first_new_item
             .clone()
             .into_iter()
             .chain(other_items.iter().cloned())
             .collect::<Vec<_>>();
 
+        // 创建编辑器以修改 impl 块
         let mut editor = edit.make_editor(impl_def.syntax());
+
+        // 如果已有关联项列表，则添加新项；否则创建新的关联项列表
         if let Some(assoc_item_list) = impl_def.assoc_item_list() {
             assoc_item_list.add_items(&mut editor, new_assoc_items);
         } else {
             let assoc_item_list = make::assoc_item_list(Some(new_assoc_items)).clone_for_update();
             editor.insert_all(
                 Position::after(impl_def.syntax()),
-                vec![make::tokens::whitespace(" ").into(), assoc_item_list.syntax().clone().into()],
+                vec![make::tokens::single_space().into(), assoc_item_list.syntax().clone().into()],
             );
             first_new_item = assoc_item_list.assoc_items().next();
         }
 
         if let Some(cap) = ctx.config.snippet_cap {
             let mut placeholder = None;
+
+            // 查找第一个新函数中的 todo! 宏作为占位符
             if let DefaultMethods::No = mode
                 && let Some(ast::AssocItem::Fn(func)) = &first_new_item
                 && let Some(m) = func.syntax().descendants().find_map(ast::MacroCall::cast)
@@ -207,6 +215,7 @@ fn add_missing_impl_members_inner(
                 placeholder = Some(m);
             }
 
+            // 添加适当的占位符或制表位
             if let Some(macro_call) = placeholder {
                 let placeholder = edit.make_placeholder_snippet(cap);
                 editor.add_annotation(macro_call.syntax(), placeholder);
@@ -215,10 +224,12 @@ fn add_missing_impl_members_inner(
                 editor.add_annotation(first_new_item.syntax(), tabstop);
             };
         };
+
         edit.add_file_edits(ctx.vfs_file_id(), editor);
     })
 }
 
+/// 尝试为 trait 方法生成函数体
 fn try_gen_trait_body(
     ctx: &AssistContext<'_>,
     func: &ast::Fn,
@@ -227,13 +238,14 @@ fn try_gen_trait_body(
     edition: Edition,
 ) -> Option<ast::BlockExpr> {
     let trait_path = make::ext::ident_path(
-        &trait_ref.trait_().name(ctx.db()).display(ctx.db(), edition).to_string(),
+        &trait_ref.trait_().name(ctx.db()).display(ctx.db(), edition).to_smolstr(),
     );
+    // 解析 impl 的自我类型
     let hir_ty = ctx.sema.resolve_type(&impl_def.self_ty()?)?;
+    // 获取 ADT（结构体/枚举/联合体）定义
     let adt = hir_ty.as_adt()?.source(ctx.db())?;
-    gen_trait_fn_body(func, &trait_path, &adt.value, Some(trait_ref))
+    crate::utils::gen_trait_fn_body(func, &trait_path, &adt.value, Some(trait_ref))
 }
-
 #[cfg(test)]
 mod tests {
     use crate::tests::{check_assist, check_assist_not_applicable};
