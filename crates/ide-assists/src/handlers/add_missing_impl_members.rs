@@ -2482,4 +2482,33 @@ impl b::Checker for MyChecker {
 }"#,
         );
     }
+
+    #[test]
+    fn test_generic_name_collision() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+trait Foo<A> {
+    fn bar<T: IntoIterator<Item = A>>(iter: T) -> Self;
+}
+struct MyStruct<T> {
+    value: T,
+}
+impl<T> Foo<T> for MyStruct<T> { $0 }
+"#,
+            r#"
+trait Foo<A> {
+    fn bar<T: IntoIterator<Item = A>>(iter: T) -> Self;
+}
+struct MyStruct<T> {
+    value: T,
+}
+impl<T> Foo<T> for MyStruct<T> {
+    fn bar<T1: IntoIterator<Item = T>>(iter: T1) -> Self {
+        ${0:todo!()}
+    }
+}
+"#,
+        );
+    }
 }

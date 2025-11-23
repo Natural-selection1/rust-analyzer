@@ -4,12 +4,12 @@ use std::slice;
 
 pub(crate) use gen_trait_fn_body::gen_trait_fn_body;
 use hir::{
-    DisplayTarget, HasAttrs as HirHasAttrs, HirDisplay, InFile, ModuleDef, PathResolution,
-    Semantics,
+    DisplayTarget, GenericParam, HasAttrs as HirHasAttrs, HirDisplay, InFile, ModuleDef,
+    PathResolution, Semantics,
     db::{ExpandDatabase, HirDatabase},
 };
 use ide_db::{
-    RootDatabase,
+    FxHashMap, FxHashSet, RootDatabase,
     assists::ExprFillDefaultMode,
     famous_defs::FamousDefs,
     path_transform::PathTransform,
@@ -17,9 +17,9 @@ use ide_db::{
 };
 use stdx::format_to;
 use syntax::{
-    AstNode, AstToken, Direction, NodeOrToken, SourceFile,
+    AstNode, AstToken, Direction, NodeOrToken, SmolStr, SourceFile,
     SyntaxKind::*,
-    SyntaxNode, SyntaxToken, T, TextRange, TextSize, WalkEvent,
+    SyntaxNode, SyntaxToken, T, TextRange, TextSize, ToSmolStr, WalkEvent,
     ast::{
         self, HasArgList, HasAttrs, HasGenericParams, HasName, HasTypeBounds, Whitespace,
         edit::{AstNodeEdit, IndentLevel},
@@ -27,6 +27,7 @@ use syntax::{
         make,
         syntax_factory::SyntaxFactory,
     },
+    format_smolstr,
     syntax_editor::{Removable, SyntaxEditor},
 };
 
@@ -219,6 +220,97 @@ pub fn add_trait_assoc_items_to_impl(
             .reset_indent();
 
             if let Some(source_scope) = sema.scope(original_item.syntax()) {
+                // 收集 impl<...> 中的泛型参数名称
+                let impl_params: FxHashSet<SmolStr> = impl_
+                    .generic_param_list()
+                    .into_iter()
+                    .flat_map(|pl| pl.generic_params())
+                    .filter_map(|p| match p {
+                        ast::GenericParam::TypeParam(it) => {
+                            it.name().map(|n| n.text().to_smolstr())
+                        }
+                        ast::GenericParam::ConstParam(it) => {
+                            it.name().map(|n| n.text().to_smolstr())
+                        }
+                        ast::GenericParam::LifetimeParam(it) => it
+                            .lifetime()
+                            .and_then(|l| l.lifetime_ident_token())
+                            .map(|t| t.text().to_smolstr()),
+                    })
+                    .collect();
+
+                let mut renames = FxHashMap::default();
+
+                let generics = match &original_item {
+                    ast::AssocItem::Fn(it) => it.generic_param_list(),
+                    ast::AssocItem::TypeAlias(it) => it.generic_param_list(),
+                    _ => None,
+                };
+
+                if let Some(generics) = generics {
+                    let item_params: FxHashSet<SmolStr> = generics
+                        .generic_params()
+                        .filter_map(|p| match p {
+                            ast::GenericParam::TypeParam(it) => {
+                                it.name().map(|n| n.text().to_smolstr())
+                            }
+                            ast::GenericParam::ConstParam(it) => {
+                                it.name().map(|n| n.text().to_smolstr())
+                            }
+                            ast::GenericParam::LifetimeParam(it) => it
+                                .lifetime()
+                                .and_then(|l| l.lifetime_ident_token())
+                                .map(|t| t.text().to_smolstr()),
+                        })
+                        .collect();
+
+                    for param in generics.generic_params() {
+                        let name_text = match &param {
+                            ast::GenericParam::TypeParam(it) => {
+                                it.name().map(|n| n.text().to_smolstr())
+                            }
+                            ast::GenericParam::ConstParam(it) => {
+                                it.name().map(|n| n.text().to_smolstr())
+                            }
+                            ast::GenericParam::LifetimeParam(it) => it
+                                .lifetime()
+                                .and_then(|l| l.lifetime_ident_token())
+                                .map(|t| t.text().to_smolstr()),
+                        };
+
+                        if let Some(name_text) = name_text
+                            && impl_params.contains(&name_text)
+                        {
+                            let mut new_name = name_text.clone();
+                            let mut i = 1;
+                            while impl_params.contains(&new_name) || item_params.contains(&new_name)
+                            {
+                                new_name = format_smolstr!("{name_text}{i}");
+                                i += 1;
+                            }
+
+                            let def = match &param {
+                                ast::GenericParam::TypeParam(tp) => {
+                                    sema.to_def(tp).map(GenericParam::TypeParam)
+                                }
+                                ast::GenericParam::ConstParam(cp) => {
+                                    sema.to_def(cp).map(GenericParam::ConstParam)
+                                }
+                                ast::GenericParam::LifetimeParam(lp) => {
+                                    sema.to_def(lp).map(GenericParam::LifetimeParam)
+                                }
+                            };
+                            if let Some(def) = def {
+                                renames.insert(def, new_name);
+                            }
+                        }
+                    }
+                }
+
+                if !renames.is_empty() {
+                    cloned_item = apply_renames(cloned_item, original_item, &renames, sema);
+                }
+
                 // FIXME: Paths in nested macros are not handled well. See
                 // `add_missing_impl_members::paths_in_nested_macro_should_get_transformed` test.
                 let transform =
@@ -1209,5 +1301,94 @@ pub(crate) fn is_never_block(
         sema.type_of_expr(&expr).is_some_and(|ty| ty.original.is_never())
     } else {
         false
+    }
+}
+
+fn apply_renames(
+    cloned_item: ast::AssocItem,
+    original_item: &ast::AssocItem,
+    renames: &FxHashMap<hir::GenericParam, SmolStr>,
+    sema: &Semantics<'_, RootDatabase>,
+) -> ast::AssocItem {
+    let match_root = cloned_item.syntax().clone_subtree();
+    let mut editor = SyntaxEditor::new(match_root.clone());
+    apply_renames_recursive(original_item.syntax(), &match_root, &mut editor, renames, sema);
+    ast::AssocItem::cast(editor.finish().new_root().clone()).unwrap()
+}
+
+fn apply_renames_recursive(
+    orig: &SyntaxNode,
+    cloned: &SyntaxNode,
+    editor: &mut SyntaxEditor,
+    renames: &FxHashMap<hir::GenericParam, SmolStr>,
+    sema: &Semantics<'_, RootDatabase>,
+) {
+    if orig.kind() != cloned.kind() {
+        return;
+    }
+
+    if let Some(gp) = ast::GenericParam::cast(orig.clone()) {
+        let def = match &gp {
+            ast::GenericParam::TypeParam(tp) => sema.to_def(tp).map(GenericParam::TypeParam),
+            ast::GenericParam::ConstParam(cp) => sema.to_def(cp).map(GenericParam::ConstParam),
+            ast::GenericParam::LifetimeParam(lp) => {
+                sema.to_def(lp).map(GenericParam::LifetimeParam)
+            }
+        };
+        if let Some(def) = def
+            && let Some(new_name) = renames.get(&def)
+            && let Some(cloned_gp) = ast::GenericParam::cast(cloned.clone())
+        {
+            match cloned_gp {
+                ast::GenericParam::TypeParam(tp) => {
+                    if let Some(name) = tp.name() {
+                        editor.replace(
+                            name.syntax().clone(),
+                            make::name(new_name).syntax().clone_for_update(),
+                        );
+                    }
+                }
+                ast::GenericParam::ConstParam(cp) => {
+                    if let Some(name) = cp.name() {
+                        editor.replace(
+                            name.syntax().clone(),
+                            make::name(new_name).syntax().clone_for_update(),
+                        );
+                    }
+                }
+                ast::GenericParam::LifetimeParam(lp) => {
+                    if let Some(lifetime) = lp.lifetime() {
+                        editor.replace(
+                            lifetime.syntax().clone(),
+                            make::lifetime(new_name).syntax().clone_for_update(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(path) = ast::Path::cast(orig.clone())
+        && let Some(resolution) = sema.resolve_path(&path)
+    {
+        let param_def = match resolution {
+            PathResolution::TypeParam(tp) => Some(GenericParam::TypeParam(tp)),
+            PathResolution::ConstParam(cp) => Some(GenericParam::ConstParam(cp)),
+            _ => None,
+        };
+        if let Some(def) = param_def
+            && let Some(new_name) = renames.get(&def)
+            && let Some(cloned_path) = ast::Path::cast(cloned.clone())
+        {
+            editor.replace(
+                cloned_path.syntax().clone(),
+                make::ext::ident_path(new_name).syntax().clone_for_update(),
+            );
+            return;
+        }
+    }
+
+    for (child_orig, child_cloned) in orig.children().zip(cloned.children()) {
+        apply_renames_recursive(&child_orig, &child_cloned, editor, renames, sema);
     }
 }
