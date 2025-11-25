@@ -1,8 +1,9 @@
 use std::cmp::Reverse;
 
 use either::Either;
-use hir::{Module, Type, db::HirDatabase};
+use hir::{ItemInNs, Module, ModuleDef, Type, db::HirDatabase};
 use ide_db::{
+    FxHashMap,
     active_parameter::ActiveParameter,
     helpers::mod_path_to_ast,
     imports::{
@@ -102,6 +103,27 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
         return None;
     }
 
+    let path_module_map =
+        proposed_imports.iter().fold(FxHashMap::default(), |mut path_module_map, import| {
+            if let ItemInNs::Types(ModuleDef::Module(module)) = import.item_to_import {
+                path_module_map.insert(import.import_path.clone(), module);
+            }
+            path_module_map
+        });
+
+    for import in &mut proposed_imports {
+        if let ItemInNs::Macros(mac) = import.item_to_import
+            && let Some(module) = path_module_map.get(&import.import_path)
+            && let mac_name = mac.name(ctx.db())
+            && import.import_path.segments().last() == Some(&mac_name)
+            && let resolved = module.resolve_mod_path(ctx.db(), std::iter::once(mac_name.clone()))
+            && let Some(mut iter) = resolved
+            && iter.any(|item| item == ItemInNs::Macros(mac))
+        {
+            import.import_path.push_segment(mac_name);
+        }
+    }
+
     let range = ctx.sema.original_range(&syntax_under_caret).range;
     let scope = ImportScope::find_insert_use_container(&syntax_under_caret, &ctx.sema)?;
 
@@ -133,32 +155,31 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
             },
         );
 
-        match import_assets.import_candidate() {
-            ImportCandidate::TraitAssocItem(name) | ImportCandidate::TraitMethod(name) => {
-                let is_method =
-                    matches!(import_assets.import_candidate(), ImportCandidate::TraitMethod(_));
-                let type_ = if is_method { "method" } else { "item" };
-                let group_label = GroupLabel(format!(
-                    "Import a trait for {} {} by alias",
-                    type_,
-                    name.assoc_item_name.text()
-                ));
-                acc.add_group(
-                    &group_label,
-                    assist_id,
-                    format!("Import `{import_name} as _`"),
-                    range,
-                    |builder| {
-                        let scope = builder.make_import_scope_mut(scope.clone());
-                        insert_use_as_alias(
-                            &scope,
-                            mod_path_to_ast(&import_path, edition),
-                            &ctx.config.insert_use,
-                        );
-                    },
-                );
-            }
-            _ => {}
+        if let ImportCandidate::TraitAssocItem(name) | ImportCandidate::TraitMethod(name) =
+            import_assets.import_candidate()
+        {
+            let is_method =
+                matches!(import_assets.import_candidate(), ImportCandidate::TraitMethod(_));
+            let type_ = if is_method { "method" } else { "item" };
+            let group_label = GroupLabel(format!(
+                "Import a trait for {} {} by alias",
+                type_,
+                name.assoc_item_name.text()
+            ));
+            acc.add_group(
+                &group_label,
+                assist_id,
+                format!("Import `{import_name} as _`"),
+                range,
+                |builder| {
+                    let scope = builder.make_import_scope_mut(scope.clone());
+                    insert_use_as_alias(
+                        &scope,
+                        mod_path_to_ast(&import_path, edition),
+                        &ctx.config.insert_use,
+                    );
+                },
+            );
         }
     }
     Some(())
@@ -202,26 +223,39 @@ pub(super) fn find_importable_node<'a: 'db, 'db>(
         }
     };
 
-    if let Some(path_under_caret) = ctx.find_node_at_offset_with_descend::<ast::Path>() {
-        let expected =
-            path_under_caret.top_path().syntax().parent().and_then(Either::cast).and_then(expected);
-        ImportAssets::for_exact_path(&path_under_caret, &ctx.sema)
-            .map(|it| (it, path_under_caret.syntax().clone(), expected))
-    } else if let Some(method_under_caret) =
-        ctx.find_node_at_offset_with_descend::<ast::MethodCallExpr>()
-    {
-        let expected = expected(Either::Left(method_under_caret.clone().into()));
-        ImportAssets::for_method_call(&method_under_caret, &ctx.sema)
-            .map(|it| (it, method_under_caret.syntax().clone(), expected))
-    } else if ctx.find_node_at_offset_with_descend::<ast::Param>().is_some() {
-        None
-    } else if let Some(pat) = ctx
-        .find_node_at_offset_with_descend::<ast::IdentPat>()
-        .filter(ast::IdentPat::is_simple_ident)
-    {
-        let expected = expected(Either::Right(pat.clone().into()));
-        ImportAssets::for_ident_pat(&ctx.sema, &pat).map(|it| (it, pat.syntax().clone(), expected))
-    } else {
+    'result: {
+        if let Some(path_under_caret) = ctx.find_node_at_offset_with_descend::<ast::Path>() {
+            let expected = path_under_caret
+                .top_path()
+                .syntax()
+                .parent()
+                .and_then(Either::cast)
+                .and_then(expected);
+            break 'result ImportAssets::for_exact_path(&path_under_caret, &ctx.sema)
+                .map(|it| (it, path_under_caret.syntax().clone(), expected));
+        }
+
+        if let Some(method_under_caret) =
+            ctx.find_node_at_offset_with_descend::<ast::MethodCallExpr>()
+        {
+            let expected = expected(Either::Left(method_under_caret.clone().into()));
+            break 'result ImportAssets::for_method_call(&method_under_caret, &ctx.sema)
+                .map(|it| (it, method_under_caret.syntax().clone(), expected));
+        }
+
+        if ctx.find_node_at_offset_with_descend::<ast::Param>().is_some() {
+            break 'result None;
+        }
+
+        if let Some(pat) = ctx
+            .find_node_at_offset_with_descend::<ast::IdentPat>()
+            .filter(ast::IdentPat::is_simple_ident)
+        {
+            let expected = expected(Either::Right(pat.clone().into()));
+            break 'result ImportAssets::for_ident_pat(&ctx.sema, &pat)
+                .map(|it| (it, pat.syntax().clone(), expected));
+        }
+
         None
     }
 }
@@ -1893,6 +1927,42 @@ mod m {
 #[cfg(test)]
 fn foo(_: S) {}
 "#,
+        );
+    }
+
+    #[test]
+    fn same_name_mod_and_macro_import1() {
+        check_assist_by_label(
+            auto_import,
+            r###"
+//- /lib.rs crate:macros
+pub mod the_name {
+    #[macro_export]
+    macro_rules! the_name { () => {} }
+
+    pub use the_name;
+
+    #[derive(Default)]
+    pub struct Bar {}
+}
+
+//- /main.rs crate:main deps:macros
+use macros::the_name::Bar;
+
+fn main() {
+    the_name$0!();
+    Bar::default();
+}
+"###,
+            r###"
+use macros::the_name::{Bar, the_name};
+
+fn main() {
+    the_name!();
+    Bar::default();
+}
+"###,
+            "Import `macros::the_name::the_name`",
         );
     }
 }
